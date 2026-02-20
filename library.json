@@ -1,0 +1,19 @@
+{
+    "name": "AP_DS18B20",
+    "version": "1.0.0",
+    "releaseDate": "2026-02-20",
+    "description": "DS18B20 temperature sensor driver for ESP-IDF with EWA software filter, error detection and power reset management",
+    "keywords": ["ds18b20", "dallas", "1-wire", "temperature", "esp-idf", "esp32"],
+    "authors": [
+        {
+            "name": "Petr Adámek"
+        }
+    ],
+    "license": "UNLICENSED",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/valachbastl/AP_DS18B20.git"
+    },
+    "frameworks": ["espidf"],
+    "platforms": ["espressif32"]
+}

@@ -1,0 +1,6 @@
+version: "1.0.0"
+description: "DS18B20 temperature sensor driver with EWA filter and power reset management"
+dependencies:
+  espressif/onewire_bus: ">=0.1.0"
+  espressif/ds18b20: ">=0.1.0"
+  idf: ">=5.0.0"
