@@ -25,7 +25,7 @@ public:
     };
 
     /**
-     * @brief Konstruktor - inicializuje 1-Wire sbernici a autodetekcí nalezne DS18B20 senzory
+     * @brief Konstruktor - pouze ulozi konfiguraci, nesaha na hardware
      * @param config Konfigurace
      */
     AP_DS18B20(const Config &config);
@@ -34,6 +34,15 @@ public:
 
     AP_DS18B20(const AP_DS18B20 &) = delete;
     AP_DS18B20 &operator=(const AP_DS18B20 &) = delete;
+
+    /**
+     * @brief Inicializuje 1-Wire sbernici a autodetekcí nalezne DS18B20 senzory.
+     *        Nutno volat pred prvnim ctenim / getSensorCount(). Misto abortu pri
+     *        chybe vraci esp_err_t.
+     * @return ESP_OK pri uspechu (i kdyz neni nalezen zadny senzor), jinak chyba
+     *         z vytvoreni 1-Wire sbernice
+     */
+    esp_err_t begin();
 
     /**
      * @brief Spusti konverzi teploty na vsech senzorech.
@@ -64,6 +73,9 @@ public:
     uint8_t getSensorCount() const;
 
 private:
+    // Horni limit senzoru na sbernici – urcuje velikost statickych poli _sensors/_states
+    // (zadny heap → determinismus, zadna fragmentace). 8 je prakticky strop pro jednu
+    // 1-Wire sbernici; pro vic zvysit konstantu.
     static constexpr uint8_t MAX_SENSORS = 8;
     static const char *TAG;
 
@@ -105,5 +117,6 @@ private:
     std::function<void()> _onPowerOn;
     std::function<void()> _onPowerOff;
 
+    esp_err_t _initBus();   // vytvori RMT sbernici + zenumeruje senzory (sdileno begin() a _reinit())
     void _reinit();
 };

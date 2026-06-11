@@ -26,13 +26,49 @@ AP_DS18B20::AP_DS18B20(const Config &config)
 
     static const int64_t convDelayUs[] = { 94000LL, 188000LL, 375000LL, 750000LL };
     _conversionDelayUs = convDelayUs[_resolution];
+    // 1-Wire sbernice i enumerace senzoru se provedou az v begin() –
+    // konstruktor nesaha na hardware a neabortuje aplikaci.
+}
+
+esp_err_t AP_DS18B20::begin()
+{
+    esp_err_t ret = _initBus();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "begin: selhalo vytvoreni 1-Wire sbernice: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    ESP_LOGI(TAG, "Nalezeno %d senzoru", _sensorCount);
+    return ESP_OK;
+}
+
+esp_err_t AP_DS18B20::_initBus()
+{
+    // Zrus pripadne stare handles senzoru a bus (volano i z _reinit po vypadku napajeni).
+    for (uint8_t i = 0; i < _sensorCount; i++) {
+        ds18b20_del_device(_sensors[i]);
+    }
+    _sensorCount = 0;
+
+    if (_bus != nullptr) {
+        onewire_bus_del(_bus);
+        _bus = nullptr;
+    }
 
     onewire_bus_config_t     busCfg = { .bus_gpio_num = _gpio_num };
+    // max_rx_bytes dano protokolem DS18B20: nejvetsi cteni je scratchpad 9 B (8 dat + CRC),
+    // 10 = +1 B rezerva. Protokolova konstanta, neladit.
     onewire_bus_rmt_config_t rmtCfg = { .max_rx_bytes = 10 };
-    ESP_ERROR_CHECK(onewire_new_bus_rmt(&busCfg, &rmtCfg, &_bus));
+    esp_err_t ret = onewire_new_bus_rmt(&busCfg, &rmtCfg, &_bus);
+    if (ret != ESP_OK) {
+        _bus = nullptr;
+        return ret;
+    }
 
     onewire_device_iter_handle_t iter;
-    ESP_ERROR_CHECK(onewire_new_device_iter(_bus, &iter));
+    ret = onewire_new_device_iter(_bus, &iter);
+    if (ret != ESP_OK) {
+        return ret;
+    }
 
     onewire_device_t device;
     while (onewire_device_iter_get_next(iter, &device) == ESP_OK) {
@@ -49,56 +85,20 @@ AP_DS18B20::AP_DS18B20(const Config &config)
     }
 
     onewire_del_device_iter(iter);
-    ESP_LOGI(TAG, "Nalezeno %d senzoru", _sensorCount);
+    return ESP_OK;
 }
 
 void AP_DS18B20::_reinit()
 {
     _pendingReinit = false;
 
-    // Zrus stare handles senzoru
-    for (uint8_t i = 0; i < _sensorCount; i++) {
-        ds18b20_del_device(_sensors[i]);
-    }
-    _sensorCount = 0;
-
-    // Zrus a znovu vytvor RMT bus - cisti interni stav driveru po vypadku napajeni senzoru
-    if (_bus != nullptr) {
-        onewire_bus_del(_bus);
-        _bus = nullptr;
-    }
-
-    onewire_bus_config_t     busCfg = { .bus_gpio_num = _gpio_num };
-    onewire_bus_rmt_config_t rmtCfg = { .max_rx_bytes = 10 };
-    if (onewire_new_bus_rmt(&busCfg, &rmtCfg, &_bus) != ESP_OK) {
-        ESP_LOGE(TAG, "Reinit: selhalo vytvoreni bus");
-        _pendingReinit = true;
+    // Plna reinicializace po vypadku napajeni – stejny init jako begin().
+    esp_err_t ret = _initBus();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Reinit: selhalo vytvoreni 1-Wire sbernice: %s", esp_err_to_name(ret));
+        _pendingReinit = true;  // zkusit znovu pristi cyklus
         return;
     }
-
-    // Znovu enumeruj senzory
-    onewire_device_iter_handle_t iter;
-    if (onewire_new_device_iter(_bus, &iter) != ESP_OK) {
-        ESP_LOGE(TAG, "Reinit: selhalo vytvoreni iter");
-        _pendingReinit = true;
-        return;
-    }
-
-    onewire_device_t device;
-    while (onewire_device_iter_get_next(iter, &device) == ESP_OK) {
-        if (_sensorCount >= MAX_SENSORS) {
-            ESP_LOGW(TAG, "Dosazeno max. poctu senzoru (%d), dalsi ignorovany", MAX_SENSORS);
-            break;
-        }
-        ds18b20_config_t dsCfg = {};
-        if (ds18b20_new_device_from_enumeration(&device, &dsCfg, &_sensors[_sensorCount]) == ESP_OK) {
-            ds18b20_set_resolution(_sensors[_sensorCount], _resolution);
-            ESP_LOGI(TAG, "Reinit DS18B20[%d]: %016llX", _sensorCount, device.address);
-            _sensorCount++;
-        }
-    }
-
-    onewire_del_device_iter(iter);
 
     if (_sensorCount == 0) {
         ESP_LOGW(TAG, "Reinit: zadny senzor nenalezen, zkusit znovu");
@@ -113,7 +113,9 @@ AP_DS18B20::~AP_DS18B20()
     for (uint8_t i = 0; i < _sensorCount; i++) {
         ds18b20_del_device(_sensors[i]);
     }
-    onewire_bus_del(_bus);
+    if (_bus != nullptr) {
+        onewire_bus_del(_bus);
+    }
 }
 
 /* ------------------------------------------------------------------ */

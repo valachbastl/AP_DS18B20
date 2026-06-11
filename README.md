@@ -12,6 +12,7 @@ DS18B20 1-Wire temperature sensor driver for ESP-IDF with EWA software filter, e
 - Error detection: CRC errors, out-of-range values, 85°C power-on reset value, temperature jump filter
 - Power reset state machine with `onPowerOn` / `onPowerOff` callbacks
 - Full bus re-initialization (`_reinit`) after power restore – handles stale RMT handles
+- Non-blocking init (`begin()` returns `esp_err_t`, never aborts the app)
 - Distinguishes between sensor not found (`NO_SENSOR_TEMP = -126`) and read error (`INVALID_TEMP = -127`)
 
 ## Dependencies
@@ -40,7 +41,7 @@ Or with specific version:
 
 ```ini
 lib_deps =
-    https://github.com/valachbastl/AP_DS18B20.git#v1.0.0
+    https://github.com/valachbastl/AP_DS18B20.git#v1.1.0
 ```
 
 ## Usage
@@ -55,6 +56,12 @@ AP_DS18B20 ds18b20({
     .onPowerOn   = []() { /* enable power to sensor */ },
     .onPowerOff  = []() { /* disable power to sensor */ },
 });
+
+// Create the 1-Wire bus and enumerate sensors (call once before reading /
+// getSensorCount). Returns esp_err_t instead of aborting on failure.
+if (ds18b20.begin() != ESP_OK) {
+    // 1-Wire bus creation failed (e.g. no free RMT channel) — handle gracefully
+}
 ```
 
 ### Configuration options
@@ -111,7 +118,8 @@ for (uint8_t i = 0; i < count; i++) {
 
 | Method | Description |
 |--------|-------------|
-| `AP_DS18B20(config)` | Constructor – initializes 1-Wire bus and enumerates sensors |
+| `AP_DS18B20(config)` | Constructor – stores config only, no hardware access |
+| `begin()` | Create 1-Wire bus and enumerate sensors; call once before other methods |
 | `convertAll()` | Trigger temperature conversion on all sensors (internally rate-limited) |
 | `getTempFiltered(index, temperature)` | Read filtered temperature for sensor at index |
 | `tick()` | Run power reset state machine – call periodically (~100 ms) |
@@ -125,3 +133,7 @@ for (uint8_t i = 0; i < count; i++) {
 ## Author
 
 Petr Adámek
+
+## License
+
+MIT — see [LICENSE](LICENSE).

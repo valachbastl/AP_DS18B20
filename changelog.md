@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.1.0] - 2026-06-11
+
+### Added
+- Inicializace `begin()` – vytvori 1-Wire sbernici a zenumeruje senzory, vraci `esp_err_t` (konstruktor uz nesaha na hardware ani neabortuje aplikaci pri chybe)
+
+### Changed
+- **BREAKING:** `begin()` je nyni nutne zavolat pred prvnim ctenim / `getSensorCount()`. Konstruktor uz sbernici nevytvari ani neenumeruje
+- Licence zmenena na MIT (drive UNLICENSED)
+
+### Refactored
+- Sjednoceni vytvoreni sbernice + enumerace do privatniho helperu `_initBus()` (sdileno `begin()` a `_reinit()`) – odstranena duplicita ~35 radku; chovani recovery (`_reinit`) i state machine napajeni beze zmeny
+
 ## [1.0.0] - 2026-02-20
 
 ### Added
