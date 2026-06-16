@@ -41,7 +41,7 @@ Or with specific version:
 
 ```ini
 lib_deps =
-    https://github.com/valachbastl/AP_DS18B20.git#v1.1.0
+    https://github.com/valachbastl/AP_DS18B20.git#v1.1.1
 ```
 
 ## Usage

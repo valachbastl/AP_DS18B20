@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.1.1] - 2026-06-16
+
+### Fixed
+- `idf_component.yml` melo `version: 1.0.0`, nesouhlasilo s `library.json` (1.1.0) - srovnano. Bez zmeny kodu (jen metadata).
+
 ## [1.1.0] - 2026-06-11
 
 ### Added
