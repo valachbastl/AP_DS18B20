@@ -7,7 +7,7 @@
 const char *AP_DS18B20::TAG = "AP_DS18B20";
 
 /* ------------------------------------------------------------------ */
-/*  Konstruktor / destruktor                                           */
+/*  Constructor / destructor                                           */
 /* ------------------------------------------------------------------ */
 
 AP_DS18B20::AP_DS18B20(const Config &config)
@@ -24,26 +24,49 @@ AP_DS18B20::AP_DS18B20(const Config &config)
     _resolution       = config.resolution;
     _gpio_num         = config.gpio_num;
 
+    // An out-of-range resolution would index past convDelayUs[] - clamp to 12 bit.
+    if ((unsigned)_resolution > (unsigned)DS18B20_RESOLUTION_12B) {
+        _resolution = DS18B20_RESOLUTION_12B;
+    }
     static const int64_t convDelayUs[] = { 94000LL, 188000LL, 375000LL, 750000LL };
     _conversionDelayUs = convDelayUs[_resolution];
-    // 1-Wire sbernice i enumerace senzoru se provedou az v begin() –
-    // konstruktor nesaha na hardware a neabortuje aplikaci.
+    // The 1-Wire bus and sensor enumeration are done only in begin() –
+    // the constructor does not touch the hardware and does not abort the application.
 }
 
 esp_err_t AP_DS18B20::begin()
 {
     esp_err_t ret = _initBus();
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "begin: selhalo vytvoreni 1-Wire sbernice: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "begin: failed to create 1-Wire bus: %s", esp_err_to_name(ret));
         return ret;
     }
-    ESP_LOGI(TAG, "Nalezeno %d senzoru", _sensorCount);
+    ESP_LOGI(TAG, "Found %d sensors", _sensorCount);
+
+    // Sensors answered -> they are powered. Go straight to ON and skip the
+    // IDLE -> ON power-up with its second enumeration. IDLE is kept only for
+    // the "nothing found" case, where the sensors may just be unpowered.
+    if (_sensorCount > 0 && _powerState == IDLE) {
+        _powerState     = ON;
+        _powerStateTime = esp_timer_get_time();
+        if (_onPowerOn) _onPowerOn();
+        ESP_LOGD(TAG, "Power ON (sensors found by begin)");
+    }
     return ESP_OK;
 }
 
 esp_err_t AP_DS18B20::_initBus()
 {
-    // Zrus pripadne stare handles senzoru a bus (volano i z _reinit po vypadku napajeni).
+    // Keep the filter state of each physical sensor across a re-enumeration:
+    // indices follow the bus order and shift when a sensor disappears, so the
+    // states are matched back by ROM address below, not by position.
+    SensorState oldStates[MAX_SENSORS];
+    const uint8_t oldCount = _sensorCount;
+    for (uint8_t i = 0; i < oldCount; i++) {
+        oldStates[i] = _states[i];
+    }
+
+    // Release any old sensor handles and the bus (also called from _reinit after a power loss).
     for (uint8_t i = 0; i < _sensorCount; i++) {
         ds18b20_del_device(_sensors[i]);
     }
@@ -55,8 +78,8 @@ esp_err_t AP_DS18B20::_initBus()
     }
 
     onewire_bus_config_t     busCfg = { .bus_gpio_num = _gpio_num };
-    // max_rx_bytes dano protokolem DS18B20: nejvetsi cteni je scratchpad 9 B (8 dat + CRC),
-    // 10 = +1 B rezerva. Protokolova konstanta, neladit.
+    // max_rx_bytes is given by the DS18B20 protocol: the largest read is the 9 B scratchpad
+    // (8 data + CRC), 10 = +1 B margin. Protocol constant, do not tune.
     onewire_bus_rmt_config_t rmtCfg = { .max_rx_bytes = 10 };
     esp_err_t ret = onewire_new_bus_rmt(&busCfg, &rmtCfg, &_bus);
     if (ret != ESP_OK) {
@@ -73,13 +96,23 @@ esp_err_t AP_DS18B20::_initBus()
     onewire_device_t device;
     while (onewire_device_iter_get_next(iter, &device) == ESP_OK) {
         if (_sensorCount >= MAX_SENSORS) {
-            ESP_LOGW(TAG, "Dosazeno max. poctu senzoru (%d), dalsi ignorovany", MAX_SENSORS);
+            ESP_LOGW(TAG, "Max. sensor count reached (%d), others ignored", MAX_SENSORS);
             break;
         }
         ds18b20_config_t dsCfg = {};
         if (ds18b20_new_device_from_enumeration(&device, &dsCfg, &_sensors[_sensorCount]) == ESP_OK) {
             ds18b20_set_resolution(_sensors[_sensorCount], _resolution);
-            ESP_LOGI(TAG, "DS18B20[%d] adresa: %016llX", _sensorCount, device.address);
+            ESP_LOGI(TAG, "DS18B20[%d] address: %016llX", _sensorCount, device.address);
+
+            SensorState state;  // new sensor: fresh state
+            state.address = device.address;
+            for (uint8_t j = 0; j < oldCount; j++) {
+                if (oldStates[j].address == device.address) {
+                    state = oldStates[j];  // known sensor: keep its filter state
+                    break;
+                }
+            }
+            _states[_sensorCount] = state;
             _sensorCount++;
         }
     }
@@ -92,19 +125,19 @@ void AP_DS18B20::_reinit()
 {
     _pendingReinit = false;
 
-    // Plna reinicializace po vypadku napajeni – stejny init jako begin().
+    // Full re-initialization after a power loss – same init as begin().
     esp_err_t ret = _initBus();
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Reinit: selhalo vytvoreni 1-Wire sbernice: %s", esp_err_to_name(ret));
-        _pendingReinit = true;  // zkusit znovu pristi cyklus
+        ESP_LOGE(TAG, "Reinit: failed to create 1-Wire bus: %s", esp_err_to_name(ret));
+        _pendingReinit = true;  // retry next cycle
         return;
     }
 
     if (_sensorCount == 0) {
-        ESP_LOGW(TAG, "Reinit: zadny senzor nenalezen, zkusit znovu");
-        _pendingReinit = true;  // zkusit znovu pristi cyklus
+        ESP_LOGW(TAG, "Reinit: no sensor found, will retry");
+        _pendingReinit = true;  // retry next cycle
     } else {
-        ESP_LOGI(TAG, "Reinit: nalezeno %d senzoru", _sensorCount);
+        ESP_LOGI(TAG, "Reinit: found %d sensors", _sensorCount);
     }
 }
 
@@ -119,21 +152,21 @@ AP_DS18B20::~AP_DS18B20()
 }
 
 /* ------------------------------------------------------------------ */
-/*  Konverze + cteni s filtrem                                         */
+/*  Conversion + filtered read                                         */
 /* ------------------------------------------------------------------ */
 
 esp_err_t AP_DS18B20::convertAll()
 {
-    // Casovani: zajistuje konverzni prodlevu i prodlevu po obnove napajeni (tick nastavi _lastConvertTimeUs=now)
+    // Timing: enforces the conversion delay as well as the delay after power restore (tick sets _lastConvertTimeUs=now)
     if ((esp_timer_get_time() - _lastConvertTimeUs) < _conversionDelayUs) {
         return ESP_OK;
     }
 
-    // Reinit po obnove napajeni - spusti se az po ubehnuti prodlevy
+    // Reinit after power restore - runs only once the delay has elapsed
     if (_pendingReinit) {
         _reinit();
         if (_sensorCount == 0) {
-            _lastConvertTimeUs = esp_timer_get_time();  // rate-limit opakovanych pokusu
+            _lastConvertTimeUs = esp_timer_get_time();  // rate-limit repeated attempts
             return ESP_OK;
         }
     }
@@ -144,10 +177,10 @@ esp_err_t AP_DS18B20::convertAll()
     if (ret == ESP_OK) {
         _lastConvertTimeUs = esp_timer_get_time();
     } else {
-        ESP_LOGW(TAG, "Chyba konverze: %s", esp_err_to_name(ret));
+        ESP_LOGW(TAG, "Conversion error: %s", esp_err_to_name(ret));
     }
 
-    // readPending nastavit vzdy - pri selhani konverze zpracuje chybu getTempFiltered
+    // Always set readPending - if the conversion failed, getTempFiltered handles the error
     for (uint8_t i = 0; i < _sensorCount; i++) {
         _states[i].readPending = true;
     }
@@ -161,7 +194,7 @@ esp_err_t AP_DS18B20::getTempFiltered(uint8_t index, float &temperature)
 
     SensorState &s = _states[index];
 
-    // Konverze nebyla spustena nebo jeste nebyla dokoncena - vrat posledni znamou hodnotu
+    // Conversion not started or not finished yet - return the last known value
     if (!s.readPending || (esp_timer_get_time() - _lastConvertTimeUs) < _conversionDelayUs) {
         temperature = s.hasValue ? s.ewaValue : NO_SENSOR_TEMP;
         return ESP_OK;
@@ -171,10 +204,10 @@ esp_err_t AP_DS18B20::getTempFiltered(uint8_t index, float &temperature)
     float raw = 0.0f;
     esp_err_t ret = ds18b20_get_temperature(_sensors[index], &raw);
 
-    // Detekce chybneho mereni: chyba komunikace, hodnota pod -125,
-    // power-on reset hodnota 85°C (dle official DallasTemperature knihovny),
-    // nebo prilis velky skok oproti posledni platne hodnote (ruseni na sbernici)
-    // Pozn: phantom 25°C check odstranen - pri pokojove teplote ~25°C zpusoboval false positive
+    // Bad reading detection: communication error, value below -125,
+    // power-on reset value 85°C (as in the official DallasTemperature library),
+    // or too large a jump from the last valid value (bus noise)
+    // Note: phantom 25°C check removed - caused false positives at room temperature ~25°C
     bool isError = (ret != ESP_OK)
                 || (raw < -125.0f)
                 || (raw == 85.0f && s.hasValue && s.ewaValue != 85.0f)
@@ -183,34 +216,36 @@ esp_err_t AP_DS18B20::getTempFiltered(uint8_t index, float &temperature)
     if (isError) {
         if (s.errorCount < 255) s.errorCount++;
     } else {
-        s.errorCount     = 0;
-        _powerResetCount = 0;
+        s.errorCount  = 0;
+        s.powerResets = 0;  // per sensor - a healthy sensor must not reset the limit of a failing one
     }
 
-    // Aktualizace EWA filtru:
-    //   errorCount == 0                → normalni aktualizace
-    //   1 .. errorIgnoreCount          → drz posledni dobrou hodnotu (prechodny glitch)
-    //   > errorIgnoreCount             → akceptuj spatnou hodnotu, spust reset napajeni
+    // EWA filter update:
+    //   errorCount == 0                → normal update
+    //   1 .. errorIgnoreCount          → hold the last good value (transient glitch)
+    //   > errorIgnoreCount             → accept the bad value, trigger a power reset
     if (s.errorCount == 0 || s.errorCount > _errorIgnoreCount) {
         float val = (ret != ESP_OK) ? INVALID_TEMP : raw;
         if (!s.hasValue || s.ewaValue < -125.0f || val < -125.0f) {
-            s.ewaValue = val;  // prvni mereni nebo obnova po chybe: primy zapis bez EWA
+            s.ewaValue = val;  // first reading or recovery after an error: direct write without EWA
         } else {
             s.ewaValue = (s.ewaValue * _filterOld) + (val * _filterNew);
         }
         s.hasValue = true;
     }
 
-    // Naplanovani resetu napajeni pri kazdem (errorIgnoreCount+1)-nasobku po sobe jdoucich chyb
-    uint8_t threshold = _errorIgnoreCount + 1;
+    // Schedule a power reset on every (errorIgnoreCount+1)-th consecutive error.
+    // 16-bit so that errorIgnoreCount = 255 cannot wrap the divisor to zero.
+    // The power line is shared by all sensors, the maxPowerResets limit is per sensor.
+    const uint16_t threshold = (uint16_t)_errorIgnoreCount + 1;
     if (s.errorCount > 0
      && (s.errorCount % threshold) == 0
-     && _powerResetCount < _maxPowerResets
+     && s.powerResets < _maxPowerResets
      && _powerState == ON) {
         _powerState     = OFF_REQ;
         _powerStateTime = esp_timer_get_time();
-        _powerResetCount++;
-        ESP_LOGW(TAG, "Senzor %d: naplanovano vypnuti napajeni #%d", index, _powerResetCount);
+        s.powerResets++;
+        ESP_LOGW(TAG, "Sensor %d: power-off scheduled #%d", index, s.powerResets);
     }
 
     temperature = s.hasValue ? s.ewaValue : INVALID_TEMP;
@@ -218,7 +253,7 @@ esp_err_t AP_DS18B20::getTempFiltered(uint8_t index, float &temperature)
 }
 
 /* ------------------------------------------------------------------ */
-/*  State machine resetu napajeni                                      */
+/*  Power reset state machine                                          */
 /* ------------------------------------------------------------------ */
 
 void AP_DS18B20::tick()
@@ -232,14 +267,14 @@ void AP_DS18B20::tick()
             if (delayOk) {
                 _powerState        = ON;
                 _powerStateTime    = now;
-                _lastConvertTimeUs = now;   // dat DS18B20 cas na inicializaci (min. jeden task cyklus)
-                _pendingReinit     = true;  // reinit bus + senzory az po ubehnuti prodlevy
+                _lastConvertTimeUs = now;   // give the DS18B20 time to initialize (at least one task cycle)
+                _pendingReinit     = true;  // reinit bus + sensors only after the delay has elapsed
                 for (uint8_t i = 0; i < _sensorCount; i++) {
                     _states[i].readPending = false;
                     _states[i].errorCount  = 0;
                 }
                 if (_onPowerOn) _onPowerOn();
-                ESP_LOGD(TAG, "Napajeni ON");
+                ESP_LOGD(TAG, "Power ON");
             }
             break;
 
@@ -248,7 +283,7 @@ void AP_DS18B20::tick()
                 _powerState     = OFF;
                 _powerStateTime = now;
                 if (_onPowerOff) _onPowerOff();
-                ESP_LOGD(TAG, "Napajeni OFF");
+                ESP_LOGD(TAG, "Power OFF");
             }
             break;
 
@@ -259,10 +294,26 @@ void AP_DS18B20::tick()
 }
 
 /* ------------------------------------------------------------------ */
-/*  Pomocne metody                                                     */
+/*  Helper methods                                                     */
 /* ------------------------------------------------------------------ */
 
 uint8_t AP_DS18B20::getSensorCount() const
 {
     return _sensorCount;
+}
+
+uint64_t AP_DS18B20::getAddress(uint8_t index) const
+{
+    return (index < _sensorCount) ? _states[index].address : 0;
+}
+
+esp_err_t AP_DS18B20::getTempByAddress(uint64_t address, float &temperature)
+{
+    for (uint8_t i = 0; i < _sensorCount; i++) {
+        if (_states[i].address == address) {
+            return getTempFiltered(i, temperature);
+        }
+    }
+    temperature = NO_SENSOR_TEMP;
+    return ESP_ERR_NOT_FOUND;
 }

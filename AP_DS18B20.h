@@ -6,29 +6,37 @@
 #include <functional>
 #include <stdint.h>
 
+/**
+ * @brief DS18B20 1-Wire temperature driver with EWA filter, error detection and
+ *        a power reset state machine.
+ *
+ * Ownership: one instance, one owning task. It is not internally locked - call
+ * tick() / getTempFiltered() / convertAll() from the same task and fan the
+ * values out to other tasks through a queue.
+ */
 class AP_DS18B20
 {
 public:
-    static constexpr float NO_SENSOR_TEMP = -126.0f;  // senzor nenalezen pri enumeraci nebo index mimo rozsah
-    static constexpr float INVALID_TEMP   = -127.0f;  // senzor nalezen, ale cteni selhalo
+    static constexpr float NO_SENSOR_TEMP = -126.0f;  // no value: sensor not found / index out of range, or no reading yet
+    static constexpr float INVALID_TEMP   = -127.0f;  // sensor found, but the read failed
 
     struct Config {
         int      gpio_num;
-        uint16_t powerDelayMs      = 5000;                       // minimalni prodleva mezi prepnutim napajeni [ms]
-        uint8_t  filterWeight      = 80;                         // vaha nove hodnoty v EWA filtru, 0-100
-        uint8_t  errorIgnoreCount  = 3;                          // pocet po sobe jdoucich chyb pred akceptaci spatne hodnoty
-        uint8_t  maxPowerResets    = 3;                          // max pocet cyklu resetu napajeni
-        float    maxTempJump       = 10.0f;                      // max povoleny skok teploty mezi merenima [°C], vetsi = glitch
-        ds18b20_resolution_t resolution  = DS18B20_RESOLUTION_12B; // rozliseni mereni (12b=0.0625°C/750ms, 9b=0.5°C/94ms)
-        std::function<void()> onPowerOn  = nullptr;              // zavolano pri zapnuti napajeni senzoru
-        std::function<void()> onPowerOff = nullptr;              // zavolano pri vypnuti napajeni senzoru
+        uint16_t powerDelayMs      = 5000;                       // minimum delay between power switching [ms]
+        uint8_t  filterWeight      = 80;                         // weight of the new value in the EWA filter, 0-100
+        uint8_t  errorIgnoreCount  = 3;                          // consecutive errors before a bad value is accepted
+        uint8_t  maxPowerResets    = 3;                          // max consecutive power resets caused by one sensor (reset by its good reading)
+        float    maxTempJump       = 10.0f;                      // max allowed temperature jump between readings [°C], larger = glitch
+        ds18b20_resolution_t resolution  = DS18B20_RESOLUTION_12B; // measurement resolution (12b=0.0625°C/750ms, 9b=0.5°C/94ms), invalid = 12b
+        std::function<void()> onPowerOn  = nullptr;              // called when sensor power is switched on (from tick(), or from begin() if it found sensors)
+        std::function<void()> onPowerOff = nullptr;              // called when sensor power is switched off (from tick())
     };
 
     /**
-     * @brief Konstruktor - pouze ulozi konfiguraci, nesaha na hardware
-     * @param config Konfigurace
+     * @brief Constructor - only stores the configuration, does not touch the hardware
+     * @param config Configuration
      */
-    AP_DS18B20(const Config &config);
+    explicit AP_DS18B20(const Config &config);
 
     ~AP_DS18B20();
 
@@ -36,61 +44,90 @@ public:
     AP_DS18B20 &operator=(const AP_DS18B20 &) = delete;
 
     /**
-     * @brief Inicializuje 1-Wire sbernici a autodetekcí nalezne DS18B20 senzory.
-     *        Nutno volat pred prvnim ctenim / getSensorCount(). Misto abortu pri
-     *        chybe vraci esp_err_t.
-     * @return ESP_OK pri uspechu (i kdyz neni nalezen zadny senzor), jinak chyba
-     *         z vytvoreni 1-Wire sbernice
+     * @brief Initializes the 1-Wire bus and auto-detects DS18B20 sensors.
+     *        Must be called before the first read / getSensorCount(). Returns
+     *        esp_err_t instead of aborting on error.
+     *        If sensors are found, they are evidently powered: the power state
+     *        machine goes straight to ON and onPowerOn is called from here
+     *        (no second enumeration). If none are found, the first tick() after
+     *        powerDelayMs switches power on and re-enumerates.
+     * @return ESP_OK on success (even if no sensor is found), otherwise the error
+     *         from creating the 1-Wire bus
      */
     esp_err_t begin();
 
     /**
-     * @brief Spusti konverzi teploty na vsech senzorech.
-     *        Pokud jeste nebyla dokoncena predchozi konverze, volani se ignoruje.
-     * @return ESP_OK pri uspechu nebo preskoceni, chybovy kod pri selhani sbernice
+     * @brief Starts a temperature conversion on all sensors.
+     *        Ignored if the previous conversion has not finished yet.
+     * @return ESP_OK on success or when skipped, error code on bus failure
      */
     esp_err_t convertAll();
 
     /**
-     * @brief Precte a filtruje teplotu senzoru na danem indexu.
-     *        Pokud konverze jeste nebyla spustena nebo nedokoncena, vrati posledni znamou hodnotu.
-     *        Aplikuje EWA filtr, detekci chyb a v pripade potreby naplanova reset napajeni.
-     * @param index Index senzoru (0 az getSensorCount()-1)
-     * @param temperature Vystupni filtrovana teplota [°C], INVALID_TEMP pokud jeste neni zadna hodnota
-     * @return ESP_OK pri uspechu, ESP_ERR_INVALID_ARG pokud index mimo rozsah
+     * @brief Reads and filters the temperature of the sensor at the given index.
+     *        If no conversion was started or it has not finished yet, returns the last known value.
+     *        Applies the EWA filter, error detection and schedules a power reset when needed.
+     * @param index Sensor index (0 to getSensorCount()-1)
+     * @param temperature Output filtered temperature [°C]; NO_SENSOR_TEMP if the index is out
+     *                    of range or there is no reading yet (e.g. right after begin() or a
+     *                    power reset); INVALID_TEMP if the read failed and there is no good
+     *                    value to hold (errors past errorIgnoreCount, or failing from the start)
+     * @return ESP_OK on success, ESP_ERR_INVALID_ARG if the index is out of range
      */
     esp_err_t getTempFiltered(uint8_t index, float &temperature);
 
     /**
-     * @brief Zpracuje state machine resetu napajeni - volat periodicky (~100 ms)
-     *        Vola onPowerOn / onPowerOff callbacky ve spravny cas
+     * @brief Same as getTempFiltered(), but selects the sensor by its ROM address.
+     *        Unlike the index (bus enumeration order), the address identifies a
+     *        physical sensor - it stays correct when indices shift after a sensor
+     *        disappears and the bus is re-initialized.
+     * @param address ROM address (see getAddress())
+     * @param temperature Output filtered temperature [°C], see getTempFiltered()
+     * @return ESP_OK on success, ESP_ERR_NOT_FOUND (temperature = NO_SENSOR_TEMP) if no
+     *         sensor with this address is currently on the bus
+     */
+    esp_err_t getTempByAddress(uint64_t address, float &temperature);
+
+    /**
+     * @brief Returns the 64-bit ROM address of the sensor at the given index -
+     *        e.g. to list the sensors and bind them to roles in the application.
+     * @return ROM address, or 0 if the index is out of range (0 is never a valid
+     *         DS18B20 address - family code 0x28)
+     */
+    uint64_t getAddress(uint8_t index) const;
+
+    /**
+     * @brief Runs the power reset state machine - call periodically (~100 ms)
+     *        Calls the onPowerOn / onPowerOff callbacks at the right time
      */
     void tick();
 
     /**
-     * @brief Vrati pocet nalezenych senzoru
+     * @brief Returns the number of sensors found
      */
     uint8_t getSensorCount() const;
 
 private:
-    // Horni limit senzoru na sbernici – urcuje velikost statickych poli _sensors/_states
-    // (zadny heap → determinismus, zadna fragmentace). 8 je prakticky strop pro jednu
-    // 1-Wire sbernici; pro vic zvysit konstantu.
+    // Upper limit of sensors on the bus – sets the size of the static arrays _sensors/_states
+    // (no heap → deterministic, no fragmentation). 8 is a practical ceiling for a single
+    // 1-Wire bus; raise the constant for more.
     static constexpr uint8_t MAX_SENSORS = 8;
     static const char *TAG;
 
     struct SensorState {
-        float   ewaValue    = 0.0f;
-        uint8_t errorCount  = 0;
-        bool    hasValue    = false;
-        bool    readPending = false;  // true po convertAll(), false po precteni vysledku
+        uint64_t address     = 0;      // ROM address - keys the state across re-enumerations
+        float    ewaValue    = 0.0f;
+        uint8_t  errorCount  = 0;
+        uint8_t  powerResets = 0;      // consecutive power resets caused by this sensor
+        bool     hasValue    = false;
+        bool     readPending = false;  // true after convertAll(), false once the result is read
     };
 
     enum PowerState : uint8_t {
-        IDLE    = 0,  // pocatecni stav
-        ON      = 1,  // napajeni zapnuto, normalni provoz
-        OFF_REQ = 2,  // zadost o vypnuti napajeni (chyba senzoru)
-        OFF     = 3,  // napajeni vypnuto, ceka na zapnuti
+        IDLE    = 0,  // initial state
+        ON      = 1,  // power on, normal operation
+        OFF_REQ = 2,  // power-off requested (sensor error)
+        OFF     = 3,  // power off, waiting to switch on
     };
 
     onewire_bus_handle_t    _bus = nullptr;
@@ -104,7 +141,6 @@ private:
     uint8_t              _errorIgnoreCount;
     uint8_t              _maxPowerResets;
     float                _maxTempJump;
-    uint8_t              _powerResetCount   = 0;
     ds18b20_resolution_t _resolution;
     int64_t              _lastConvertTimeUs = 0;
     int64_t              _conversionDelayUs;
@@ -117,6 +153,6 @@ private:
     std::function<void()> _onPowerOn;
     std::function<void()> _onPowerOff;
 
-    esp_err_t _initBus();   // vytvori RMT sbernici + zenumeruje senzory (sdileno begin() a _reinit())
+    esp_err_t _initBus();   // creates the RMT bus + enumerates sensors (shared by begin() and _reinit())
     void _reinit();
 };

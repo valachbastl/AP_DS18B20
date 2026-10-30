@@ -12,8 +12,8 @@ DS18B20 1-Wire temperature sensor driver for ESP-IDF with EWA software filter, e
 - Error detection: CRC errors, out-of-range values, 85°C power-on reset value, temperature jump filter
 - Power reset state machine with `onPowerOn` / `onPowerOff` callbacks
 - Full bus re-initialization (`_reinit`) after power restore – handles stale RMT handles
-- Non-blocking init (`begin()` returns `esp_err_t`, never aborts the app)
-- Distinguishes between sensor not found (`NO_SENSOR_TEMP = -126`) and read error (`INVALID_TEMP = -127`)
+- Non-aborting init (`begin()` returns `esp_err_t`, never aborts the app)
+- Distinguishes between no value (`NO_SENSOR_TEMP = -126` — sensor not found, or no reading yet) and read error (`INVALID_TEMP = -127`)
 
 ## Dependencies
 
@@ -21,8 +21,8 @@ Add to your project's `idf_component.yml`:
 
 ```yaml
 dependencies:
-  espressif/onewire_bus: ">=0.1.0"
-  espressif/ds18b20: ">=0.1.0"
+  espressif/onewire_bus: ">=1.0.3"
+  espressif/ds18b20: ">=0.2.0"
   idf: ">=5.0.0"
 ```
 
@@ -41,7 +41,7 @@ Or with specific version:
 
 ```ini
 lib_deps =
-    https://github.com/valachbastl/AP_DS18B20.git#v1.1.1
+    https://github.com/valachbastl/AP_DS18B20.git#v1.2.0
 ```
 
 ## Usage
@@ -72,7 +72,7 @@ cfg.gpio_num         = GPIO_NUM_4;          // 1-Wire GPIO pin
 cfg.powerDelayMs     = 5000;                // min delay between power state transitions [ms]
 cfg.filterWeight     = 80;                  // EWA weight for new value, 0–100
 cfg.errorIgnoreCount = 3;                   // consecutive errors to ignore before accepting bad value
-cfg.maxPowerResets   = 3;                   // max power reset cycles
+cfg.maxPowerResets   = 3;                   // max consecutive power resets caused by one sensor
 cfg.maxTempJump      = 10.0f;               // max allowed temperature jump between readings [°C]
 cfg.resolution       = DS18B20_RESOLUTION_12B;  // 9–12 bit (94/188/375/750 ms conversion)
 cfg.onPowerOn        = nullptr;             // callback: called when power is turned ON
@@ -96,7 +96,7 @@ ds18b20.convertAll();
 
 // Check result
 if (temp == AP_DS18B20::NO_SENSOR_TEMP) {
-    // sensor not found during enumeration
+    // no value: sensor not found, or no reading yet (right after begin() / power reset)
 } else if (temp == AP_DS18B20::INVALID_TEMP) {
     // sensor found but read failed
 } else {
@@ -114,6 +114,24 @@ for (uint8_t i = 0; i < count; i++) {
 }
 ```
 
+Indices follow the bus enumeration order and can shift when a sensor
+disappears. To bind sensors to roles (boiler, outdoor, …), use their ROM
+address — it identifies the physical sensor:
+
+```cpp
+// List the sensors once (e.g. to show them in a configuration UI)
+for (uint8_t i = 0; i < ds18b20.getSensorCount(); i++) {
+    printf("DS18B20[%u] = %016llX\n", i, ds18b20.getAddress(i));
+}
+
+// Read by address - stays correct even if the indices shift
+static constexpr uint64_t BOILER = 0xFA23DF0D1E64FF28ULL;
+float boilerTemp;
+if (ds18b20.getTempByAddress(BOILER, boilerTemp) == ESP_ERR_NOT_FOUND) {
+    // this sensor is not on the bus right now (boilerTemp == NO_SENSOR_TEMP)
+}
+```
+
 ## API Reference
 
 | Method | Description |
@@ -122,13 +140,35 @@ for (uint8_t i = 0; i < count; i++) {
 | `begin()` | Create 1-Wire bus and enumerate sensors; call once before other methods |
 | `convertAll()` | Trigger temperature conversion on all sensors (internally rate-limited) |
 | `getTempFiltered(index, temperature)` | Read filtered temperature for sensor at index |
+| `getTempByAddress(address, temperature)` | Same, but selects the sensor by ROM address; `ESP_ERR_NOT_FOUND` if it is not on the bus |
+| `getAddress(index)` | 64-bit ROM address of the sensor at index (0 = index out of range) |
 | `tick()` | Run power reset state machine – call periodically (~100 ms) |
 | `getSensorCount()` | Returns number of sensors found during enumeration |
 
 | Constant | Value | Description |
 |----------|-------|-------------|
-| `NO_SENSOR_TEMP` | -126.0f | Sensor not found (index out of range or not enumerated) |
-| `INVALID_TEMP` | -127.0f | Sensor found but read failed |
+| `NO_SENSOR_TEMP` | -126.0f | No value: sensor not found (index out of range / not enumerated) or no reading yet |
+| `INVALID_TEMP` | -127.0f | Sensor found but read failed and there is no good value to hold (errors past `errorIgnoreCount`, or failing from the start) |
+
+## Notes
+
+- **One instance is owned by one task.** The driver is not internally locked;
+  call `tick()`, `getTempFiltered()` and `convertAll()` from the same task and
+  share the values with other tasks through a queue.
+- `resolution` out of range falls back to 12 bit.
+- Sensor indices follow the bus enumeration order. With several sensors, if one
+  disappears and the bus is re-initialized (power reset), the indices of the
+  remaining sensors can shift — use `getTempByAddress()` when a reading must
+  belong to a specific sensor. The filter state follows the physical sensor
+  (matched by ROM address), so a shift never mixes the readings of two sensors.
+- The sensors share one power line: a power reset triggered by a failing
+  sensor cycles all of them. The `maxPowerResets` limit is counted per sensor
+  and cleared by that sensor's own good reading, so a healthy sensor on the
+  same bus cannot keep re-arming the resets of a dead one.
+- Power at startup: if `begin()` finds sensors, they are evidently powered —
+  the power state machine starts in ON and `onPowerOn` is called from `begin()`.
+  If none are found, the first `tick()` after `powerDelayMs` calls `onPowerOn`
+  and re-enumerates the bus (the sensors may just have been unpowered).
 
 ## Author
 
